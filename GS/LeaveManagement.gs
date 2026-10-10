@@ -175,8 +175,31 @@ function submitLeaveRequest(sessionToken, leaveType, startDateTime, endDateTime,
       ''                           // N: 審核意見
     ];
     
+    // 鎖定後再檢查重複並寫入，避免連續送出時同時寫入多筆
+    const lock = LockService.getScriptLock();
     try {
+      lock.waitLock(10000);
+    } catch (lockError) {
+      Logger.log(' 取得鎖定失敗: ' + lockError.message);
+      return {
+        ok: false,
+        code: "ERR_BUSY",
+        msg: "系統忙碌中，請稍後再試"
+      };
+    }
+
+    try {
+      if (hasOverlappingLeave_(sheet, user.userId, start, end)) {
+        Logger.log(' 已有重疊的請假申請，拒絕重複送出');
+        return {
+          ok: false,
+          code: "ERR_DUPLICATE_LEAVE",
+          msg: "此時段已有請假申請，請勿重複送出"
+        };
+      }
+
       sheet.appendRow(row);
+      SpreadsheetApp.flush();
       Logger.log(' 資料寫入成功');
     } catch (writeError) {
       Logger.log(' 資料寫入失敗: ' + writeError.message);
@@ -185,6 +208,8 @@ function submitLeaveRequest(sessionToken, leaveType, startDateTime, endDateTime,
         code: "ERR_WRITE_FAILED",
         msg: "無法寫入請假記錄"
       };
+    } finally {
+      lock.releaseLock();
     }
 
     //  通知所有管理員
@@ -234,6 +259,26 @@ function submitLeaveRequest(sessionToken, leaveType, startDateTime, endDateTime,
       msg: "系統錯誤：" + error.message
     };
   }
+}
+
+/**
+ * 檢查同一員工是否已有時段重疊、且未被拒絕的請假申請
+ */
+function hasOverlappingLeave_(sheet, userId, start, end) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return false;
+
+  const values = sheet.getRange(2, 1, lastRow - 1, 11).getValues();
+  const toDate = (v) => (v instanceof Date) ? v : new Date(String(v).replace(' ', 'T'));
+
+  return values.some(r => {
+    if (String(r[1]).trim() !== userId) return false;
+    if (String(r[10]).trim() === 'REJECTED') return false;
+    const s = toDate(r[5]);
+    const e = toDate(r[6]);
+    if (isNaN(s.getTime()) || isNaN(e.getTime())) return false;
+    return s < end && e > start;
+  });
 }
 
 /**

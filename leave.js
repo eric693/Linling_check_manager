@@ -323,13 +323,27 @@ function quickSelectTimeRange(type) {
     updateWorkHoursPreview();
 }
 
+let isSubmittingLeave = false;
+
 async function submitLeaveApplication() {
     console.log(' 開始提交請假申請');
+    
+    // 防止連續點擊重複送出
+    if (isSubmittingLeave) return;
     
     if (!validateLeaveForm()) {
         console.error(' 表單驗證失敗');
         return;
     }
+    
+    isSubmittingLeave = true;
+    const button = document.getElementById('submit-leave-btn');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '處理中...';
+    }
+    
+    try {
     
     const leaveType = document.getElementById('leave-type').value;
     const startTime = document.getElementById('leave-start-datetime').value;
@@ -370,13 +384,6 @@ async function submitLeaveApplication() {
         console.error(' 檢查餘額失敗:', error);
     }
     
-    const button = document.getElementById('submit-leave-btn');
-    if (button) {
-        button.disabled = true;
-        button.textContent = '處理中...';
-    }
-    
-    try {
         const response = await callApifetch(
             `submitLeave&leaveType=${encodeURIComponent(leaveType)}` +
             `&startDateTime=${encodeURIComponent(startTime)}` +
@@ -412,6 +419,7 @@ async function submitLeaveApplication() {
         console.error(' 提交請假申請失敗:', error);
         showNotification('網路錯誤，請稍後再試', 'error');
     } finally {
+        isSubmittingLeave = false;
         if (button) {
             button.disabled = false;
             button.textContent = '提交請假申請';
