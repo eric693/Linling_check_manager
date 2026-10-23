@@ -12,7 +12,7 @@ let _isPunching = false;
 // 載入語系檔
 async function loadTranslations(lang) {
     try {
-        const res = await fetch(`https://eric693.github.io/Linling_check_manager/i18n/${lang}.json`);
+        const res = await fetch(`https://eric693.github.io/yi-chun_check_manager/i18n/${lang}.json`);
         if (!res.ok) {
             throw new Error(`HTTP 錯誤: ${res.status}`);
         }
@@ -100,15 +100,19 @@ function renderTranslations(container = document) {
  * @param {string} [loadingId="loading"] - 顯示 loading 狀態的 DOM 元素 ID。
  * @returns {Promise<object>} - 回傳一個包含 API 回應資料的 Promise。
  */
-async function callApifetch(action, loadingId = "loading") {
+async function callApifetch(action, loadingId = "loading", options = {}) {
+    const { silent = false, timeoutMs = 0 } = options;
     const token = localStorage.getItem("sessionToken");
     const url = `${API_CONFIG.apiUrl}?action=${action}&token=${token}`;
     
     const loadingEl = document.getElementById(loadingId);
     if (loadingEl) loadingEl.style.display = "block";
     
+    const controller = timeoutMs > 0 ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    
     try {
-        const response = await fetch(url);
+        const response = await fetch(url, controller ? { signal: controller.signal } : undefined);
         
         if (!response.ok) {
             throw new Error(`HTTP 錯誤: ${response.status}`);
@@ -139,10 +143,11 @@ async function callApifetch(action, loadingId = "loading") {
         
         return data;
     } catch (error) {
-        showNotification(t("CONNECTION_FAILED"), "error");
+        if (!silent) showNotification(t("CONNECTION_FAILED"), "error");
         console.error("API 呼叫失敗:", error);
         throw error;
     } finally {
+        if (timer) clearTimeout(timer);
         if (loadingEl) loadingEl.style.display = "none";
     }
 }
@@ -2210,6 +2215,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             initShiftTab();
         } else if (tabId === 'admin-view') {
             fetchAndRenderReviewRequests();
+            loadPendingPunchRemarks();   //  下班打卡備註審核
             loadPendingOvertimeRequests();
             loadPendingWorklogs();  // 
             loadPendingLeaveRequests();
@@ -2389,7 +2395,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     
     logoutBtn.onclick = () => {
         localStorage.removeItem("sessionToken");
-        window.location.href = "/Linling_check_manager"
+        window.location.href = "/yi-chun_check_manager"
     };
     
     /* ===== 打卡功能 ===== */
@@ -3838,7 +3844,20 @@ async function doPunch(type) {
     const button = document.getElementById(punchButtonId);
     const loadingText = t('LOADING') || '處理中...';
 
-    if (!button) return;
+    if (!button) {
+        _isPunching = false;   //  原本直接 return，鎖沒解開，之後就再也不能打卡
+        return;
+    }
+
+    //  下班打卡：讓員工可自行填寫備註（例如提早下班原因），送出後由管理員審核
+    let punchRemark = '';
+    if (type === '下班') {
+        punchRemark = await askPunchRemark();
+        if (punchRemark === null) {       // 使用者按取消
+            _isPunching = false;
+            return;
+        }
+    }
 
     generalButtonState(button, 'processing', loadingText);
     
@@ -3903,18 +3922,50 @@ async function doPunch(type) {
         const now = new Date();
         const datetime = now.toISOString();
 
-        const action = `punch&type=${encodeURIComponent(type)}&lat=${lat}&lng=${lng}&datetime=${encodeURIComponent(datetime)}&note=${encodeURIComponent(navigator.userAgent)}`;
+        const action = `punch&type=${encodeURIComponent(type)}&lat=${lat}&lng=${lng}&datetime=${encodeURIComponent(datetime)}&note=${encodeURIComponent(navigator.userAgent)}&remark=${encodeURIComponent(punchRemark || '')}`;
+
+        // 行動網路不穩時自動重試；若前一次其實已寫入，後端會回 ERR_DUPLICATE_PUNCH，視為成功
+        const MAX_ATTEMPTS = 2;
+        let res = null;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                //  逾時由 30 秒縮短為 12 秒、重試由 3 次改為 2 次
+                //  （原本最久會卡在「處理中」將近 95 秒，看起來像當掉）
+                res = await callApifetch(action, "loading", { silent: true, timeoutMs: 12000 });
+                if (attempt > 1 && res.code === 'ERR_DUPLICATE_PUNCH') {
+                    res = { ok: true, code: 'PUNCH_SUCCESS', params: { type: type } };
+                }
+                break;
+            } catch (err) {
+                lastErr = err;
+                console.error(`打卡第 ${attempt} 次失敗:`, err);
+                if (attempt < MAX_ATTEMPTS) {
+                    generalButtonState(button, 'processing', '重試中...');
+                    showNotification('連線不穩，正在重試...', 'warning');
+                    await new Promise(r => setTimeout(r, 1200));
+                }
+            }
+        }
 
         try {
-            const res = await callApifetch(action);
-            const msg = t(res.code || "UNKNOWN_ERROR", res.params || {});
-            showNotification(msg, res.ok ? "success" : "error");
+            if (res) {
+                const msg = (res.code && translations[res.code])
+                    ? t(res.code, res.params || {})
+                    : (res.msg || t(res.code || "UNKNOWN_ERROR", res.params || {}));
+                showNotification(msg, res.ok ? "success" : "error");
 
-            if (res.ok && type === '上班') {
-                clearShiftCache();
+                if (res.ok && res.remarkSubmitted) {
+                    showNotification('備註已送出，等待管理員審核', 'info');
+                }
+
+                if (res.ok && type === '上班') {
+                    clearShiftCache();
+                }
+            } else {
+                const reason = lastErr && lastErr.name === 'AbortError' ? '伺服器回應逾時' : '網路連線中斷';
+                showNotification(`${type}打卡失敗（${reason}）。請確認網路後再按一次；若仍失敗，請重新整理頁面或改用補打卡。`, 'error');
             }
-        } catch (err) {
-            console.error(err);
         } finally {
             generalButtonState(button, 'idle');
             _isPunching = false;  //  釋放鎖
@@ -3923,7 +3974,7 @@ async function doPunch(type) {
         showNotification(t("ERROR_GEOLOCATION", { msg: err.message }), "error");
         generalButtonState(button, 'idle');
         _isPunching = false;  //  釋放鎖（定位失敗也要釋放）
-    });
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 });
 }
 
 /**
@@ -5116,7 +5167,28 @@ async function handleLinePunchFromUrl() {
             lng: position.coords.longitude
         });
 
-        const res = await callApifetch(`linePunch&${params.toString()}`);
+        //  行動網路不穩時自動重試（後端已改為打卡成功才讓連結失效，重試是安全的）
+        let res = null;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                res = await callApifetch(`linePunch&${params.toString()}`, 'loading', { silent: true, timeoutMs: 30000 });
+                break;
+            } catch (fetchErr) {
+                lastErr = fetchErr;
+                console.error(`LINE 打卡第 ${attempt} 次失敗:`, fetchErr);
+                if (attempt < 3) {
+                    overlay.querySelector('#lpo-sub').textContent = `連線不穩，重試中（${attempt}/2）...`;
+                    await new Promise(r => setTimeout(r, 1500 * attempt));
+                }
+            }
+        }
+
+        if (!res) {
+            const reason = lastErr && lastErr.name === 'AbortError' ? '伺服器回應逾時' : '網路連線中斷';
+            setResult('❌', '打卡失敗', `${reason}。請確認網路後，再點一次同一個連結重試。`, '#f44336');
+            return;
+        }
 
         if (res.ok) {
             const typeText = res.punchType === '上班' ? '🟢 上班打卡' : '🟠 下班打卡';
@@ -5149,10 +5221,11 @@ async function handleLinePunchFromUrl() {
             await loadAbnormalRecordsInBackground();
         } else {
             const msgMap = {
-                ERR_LPT_INVALID:  '連結無效或已使用，請重新在 LINE 輸入打卡指令',
-                ERR_LPT_EXPIRED:  '連結已過期（5 分鐘），請重新在 LINE 輸入打卡指令',
-                ERR_NOT_IN_RANGE: res.msg || '不在打卡範圍內',
-                ERR_DUPLICATE_PUNCH: '您剛剛已打過卡了'
+                ERR_LPT_INVALID:  '此連結已完成打卡或已失效。請先在 LINE 輸入「查詢」確認是否已打卡成功；若尚未打卡，請重新輸入打卡指令取得新連結。',
+                ERR_LPT_EXPIRED:  '連結已過期（15 分鐘），請在 LINE 重新輸入打卡指令',
+                ERR_NOT_IN_RANGE: (res.msg || '不在打卡範圍內') + '\n（可移動到正確位置後，再點一次同一個連結重試）',
+                ERR_DUPLICATE_PUNCH: '您剛剛已打過卡了',
+                ERR_BUSY: '系統忙碌中，請再點一次連結重試'
             };
             setResult('❌', '打卡失敗', msgMap[res.code] || res.msg || '請稍後再試', '#f44336');
         }
@@ -5162,11 +5235,199 @@ async function handleLinePunchFromUrl() {
     }
 }
 
+// ==================== 下班打卡備註（員工自填 + 管理員審核）====================
+
+/**
+ *  下班打卡前詢問備註
+ *  回傳：填寫的備註字串（可為空字串代表不填），按取消則回傳 null
+ *  註：LINE 內建瀏覽器會擋 prompt()，所以自建對話框
+ */
+function askPunchRemark() {
+    return new Promise((resolve) => {
+        const today = new Date();
+        const dateLabel = `${today.getMonth() + 1}/${today.getDate()}`;
+        const timeLabel = `${String(today.getHours()).padStart(2, '0')}:${String(today.getMinutes()).padStart(2, '0')}`;
+
+        const overlay = document.createElement('div');
+        overlay.id = 'punch-remark-overlay';
+        overlay.style.cssText =
+            'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9998;' +
+            'display:flex;align-items:center;justify-content:center;padding:16px;';
+
+        overlay.innerHTML = `
+            <div style="background:#fff;border-radius:16px;max-width:420px;width:100%;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+                <div style="font-size:18px;font-weight:700;color:#111;margin-bottom:6px;">下班打卡備註</div>
+                <div style="font-size:13px;color:#666;line-height:1.5;margin-bottom:12px;">
+                    若今天提早下班或有特殊狀況，請在此說明。<br>
+                    送出後會通知管理員審核。沒有要說明可直接按「不填，直接打卡」。
+                </div>
+                <textarea id="punch-remark-input" rows="3" maxlength="200"
+                    placeholder="例如：今日 ${dateLabel} ${timeLabel} 下班，今日工事已完成"
+                    style="width:100%;padding:10px;border:1px solid #d1d5db;border-radius:10px;font-size:15px;
+                           box-sizing:border-box;resize:vertical;color:#111;background:#fff;"></textarea>
+                <div style="font-size:12px;color:#999;margin-top:4px;text-align:right;">
+                    <span id="punch-remark-count">0</span>/200
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;">
+                    <button id="punch-remark-submit"
+                        style="width:100%;padding:12px;border:none;border-radius:10px;background:#4f46e5;color:#fff;font-size:16px;font-weight:700;">
+                        送出備註並打卡
+                    </button>
+                    <button id="punch-remark-skip"
+                        style="width:100%;padding:12px;border:1px solid #d1d5db;border-radius:10px;background:#fff;color:#374151;font-size:15px;font-weight:600;">
+                        不填，直接打卡
+                    </button>
+                    <button id="punch-remark-cancel"
+                        style="width:100%;padding:10px;border:none;border-radius:10px;background:transparent;color:#9ca3af;font-size:14px;">
+                        取消
+                    </button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        const input = overlay.querySelector('#punch-remark-input');
+        const counter = overlay.querySelector('#punch-remark-count');
+
+        input.addEventListener('input', () => {
+            counter.textContent = input.value.length;
+        });
+
+        const close = (value) => {
+            overlay.remove();
+            resolve(value);
+        };
+
+        overlay.querySelector('#punch-remark-submit').onclick = () => {
+            const text = input.value.trim();
+            if (!text) {
+                showNotification('請輸入備註內容，或選擇「不填，直接打卡」', 'warning');
+                return;
+            }
+            close(text);
+        };
+        overlay.querySelector('#punch-remark-skip').onclick = () => close('');
+        overlay.querySelector('#punch-remark-cancel').onclick = () => close(null);
+
+        setTimeout(() => input.focus(), 100);
+    });
+}
+
+/**
+ *  載入待審核的打卡備註（管理員）
+ */
+async function loadPendingPunchRemarks() {
+    const listEl = document.getElementById('punch-remarks-list');
+    const loadingEl = document.getElementById('punch-remarks-loading');
+    const emptyEl = document.getElementById('punch-remarks-empty');
+
+    if (!listEl) return;
+
+    try {
+        if (loadingEl) loadingEl.style.display = 'block';
+        if (emptyEl) emptyEl.style.display = 'none';
+        listEl.innerHTML = '';
+
+        const res = await callApifetch('getPendingPunchRemarks', 'punch-remarks-loading');
+
+        if (loadingEl) loadingEl.style.display = 'none';
+
+        if (!res.ok || !res.records || res.records.length === 0) {
+            if (emptyEl) emptyEl.style.display = 'block';
+            return;
+        }
+
+        res.records.forEach(record => {
+            const item = document.createElement('div');
+            item.className = 'p-4 border border-gray-200 dark:border-gray-700 rounded-lg';
+            item.innerHTML = `
+                <div class="flex justify-between items-start mb-2">
+                    <div>
+                        <span class="font-bold text-gray-800 dark:text-white">${escapeHtml(record.employeeName || '')}</span>
+                        <span class="ml-2 text-sm ${record.type === '上班' ? 'text-green-600' : 'text-orange-600'}">${escapeHtml(record.type || '')}打卡</span>
+                    </div>
+                    <span class="text-sm text-gray-500 dark:text-gray-400">${escapeHtml(record.date || '')} ${escapeHtml(record.time || '')}</span>
+                </div>
+                <div class="p-3 bg-gray-50 dark:bg-gray-700/50 rounded text-sm text-gray-700 dark:text-gray-200 whitespace-pre-wrap mb-3">${escapeHtml(record.remark || '')}</div>
+                <div class="flex gap-2">
+                    <button class="approve-remark-btn flex-1 py-2 rounded-lg font-bold text-white bg-green-600" data-row="${record.rowNumber}">核准</button>
+                    <button class="reject-remark-btn flex-1 py-2 rounded-lg font-bold text-gray-700 bg-gray-200 dark:bg-gray-600 dark:text-white" data-row="${record.rowNumber}">退回</button>
+                </div>
+            `;
+            listEl.appendChild(item);
+        });
+
+        listEl.querySelectorAll('.approve-remark-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => handleReviewPunchRemark(e.currentTarget, 'approve'));
+        });
+        listEl.querySelectorAll('.reject-remark-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => handleReviewPunchRemark(e.currentTarget, 'reject'));
+        });
+
+    } catch (error) {
+        console.error('載入打卡備註失敗:', error);
+        if (loadingEl) loadingEl.style.display = 'none';
+        if (emptyEl) emptyEl.style.display = 'block';
+    }
+}
+
+/**
+ *  審核打卡備註
+ */
+async function handleReviewPunchRemark(button, action) {
+    const rowNumber = button.dataset.row;
+    let comment = '';
+
+    if (action === 'reject') {
+        comment = prompt('請輸入退回原因（可留空）：') || '';
+    }
+
+    button.disabled = true;
+    const originalText = button.textContent;
+    button.textContent = '處理中...';
+
+    try {
+        const res = await callApifetch(
+            `reviewPunchRemark&rowNumber=${encodeURIComponent(rowNumber)}` +
+            `&reviewAction=${action}` +
+            `&comment=${encodeURIComponent(comment)}`
+        );
+
+        if (res.ok) {
+            showNotification(action === 'approve' ? '已核准' : '已退回', 'success');
+            await loadPendingPunchRemarks();
+        } else {
+            showNotification(res.msg || '審核失敗', 'error');
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    } catch (err) {
+        console.error('審核打卡備註失敗:', err);
+        showNotification('網路錯誤，請稍後再試', 'error');
+        button.disabled = false;
+        button.textContent = originalText;
+    }
+}
+
+/**
+ *  簡易 HTML escape，避免員工備註內容破壞版面
+ */
+function escapeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // ==================== QR Code 打卡系統 ====================
 
 let _qrCountdownInterval = null;
 let _qrExpiryTime = null;
 let _qrTotalMs = null;
+let _currentQRInfo = null;   //  目前顯示的 QR 資訊（供列印使用）
 
 /**
  * 處理登入後待執行的 QR 打卡
@@ -5222,18 +5483,23 @@ async function performQRPunch(qrTokenId) {
 async function generateAdminQRCode() {
     const punchTypeEl = document.querySelector('input[name="qr-punch-type"]:checked');
     const punchType   = punchTypeEl ? punchTypeEl.value : '上班';
-    const typeCode    = punchType === '上班' ? 'I' : 'O';
+    //  A = 自動判斷（今天還沒打上班就記上班，否則記下班）
+    const typeCode    = punchType === '自動' ? 'A' : (punchType === '上班' ? 'I' : 'O');
 
     const validSelect = document.getElementById('qr-valid-minutes');
-    let validMinutes;
-    if (validSelect.value === 'custom') {
-        validMinutes = parseInt(document.getElementById('qr-valid-minutes-custom').value);
-        if (!validMinutes || validMinutes < 1 || validMinutes > 1440) {
-            showNotification('請輸入有效的分鐘數（1~1440）', 'error');
-            return;
+    let validMinutes = null;          // null 代表永久有效
+    const isPermanent = validSelect.value === 'PERM';
+
+    if (!isPermanent) {
+        if (validSelect.value === 'custom') {
+            validMinutes = parseInt(document.getElementById('qr-valid-minutes-custom').value);
+            if (!validMinutes || validMinutes < 1 || validMinutes > 1440) {
+                showNotification('請輸入有效的分鐘數（1~1440）', 'error');
+                return;
+            }
+        } else {
+            validMinutes = parseInt(validSelect.value);
         }
-    } else {
-        validMinutes = parseInt(validSelect.value);
     }
 
     const locationName = (document.getElementById('qr-location-name').value || '').trim();
@@ -5244,15 +5510,24 @@ async function generateAdminQRCode() {
 
     try {
         // 純前端產生 token，不呼叫後端
-        const expiryMs  = Date.now() + validMinutes * 60 * 1000;
-        const expiryHex = expiryMs.toString(16).toUpperCase();
+        const expiryMs  = isPermanent ? null : Date.now() + validMinutes * 60 * 1000;
+        const expiryPart = isPermanent ? 'PERM' : expiryMs.toString(16).toUpperCase();
         const random    = Math.random().toString(16).slice(2, 10).toUpperCase();
-        const tokenId   = `${typeCode}_${expiryHex}_${random}`;
+        const tokenId   = `${typeCode}_${expiryPart}_${random}`;
+
+        //  記住目前這張 QR 的資訊，供列印使用
+        _currentQRInfo = {
+            url: null,              // 下方組好後填入
+            punchType: punchType,
+            locationName: locationName,
+            isPermanent: isPermanent
+        };
 
         // 組成員工掃描後開啟的 URL
         const redirectUrl = API_CONFIG.redirectUrl.replace(/\/$/, '');
         const locParam    = locationName ? `&loc=${encodeURIComponent(locationName)}` : '';
         const punchUrl    = `${redirectUrl}/?qrToken=${tokenId}${locParam}`;
+        _currentQRInfo.url = punchUrl;
 
         // 使用 qrcodejs 在瀏覽器端直接產生 QR Code（同步，不需要 Promise）
         const qrContainer = document.getElementById('qr-image');
@@ -5268,8 +5543,8 @@ async function generateAdminQRCode() {
 
         // 標籤顯示
         const typeBadge = document.getElementById('qr-type-badge');
-        typeBadge.textContent = punchType === '上班' ? '上班打卡' : '下班打卡';
-        typeBadge.className   = punchType === '上班'
+        typeBadge.textContent = punchType === '自動' ? '上下班通用' : (punchType === '上班' ? '上班打卡' : '下班打卡');
+        typeBadge.className   = (punchType === '上班' || punchType === '自動')
             ? 'inline-block px-3 py-1 rounded-full text-sm font-bold mb-3 bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
             : 'inline-block px-3 py-1 rounded-full text-sm font-bold mb-3 bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300';
 
@@ -5287,14 +5562,25 @@ async function generateAdminQRCode() {
         document.getElementById('qr-image').style.opacity               = '1';
         document.getElementById('qr-countdown-container').style.display = 'block';
 
-        // 啟動倒數計時
-        _qrExpiryTime = expiryMs;
-        _qrTotalMs    = validMinutes * 60 * 1000;
-        if (_qrCountdownInterval) clearInterval(_qrCountdownInterval);
-        _tickQRCountdown();
-        _qrCountdownInterval = setInterval(_tickQRCountdown, 1000);
+        if (isPermanent) {
+            //  永久有效：不倒數，直接顯示提示
+            if (_qrCountdownInterval) clearInterval(_qrCountdownInterval);
+            _qrCountdownInterval = null;
+            _qrExpiryTime = null;
+            document.getElementById('qr-countdown').textContent = '永久有效';
+            document.getElementById('qr-countdown').className = 'text-2xl font-bold text-green-600 dark:text-green-400';
+            document.getElementById('qr-progress-fill').style.width = '100%';
+            showNotification('永久有效的 QR Code 已產生，可列印張貼', 'success');
+        } else {
+            // 啟動倒數計時
+            _qrExpiryTime = expiryMs;
+            _qrTotalMs    = validMinutes * 60 * 1000;
+            if (_qrCountdownInterval) clearInterval(_qrCountdownInterval);
+            _tickQRCountdown();
+            _qrCountdownInterval = setInterval(_tickQRCountdown, 1000);
 
-        showNotification(`QR Code 已產生，${validMinutes} 分鐘內有效`, 'success');
+            showNotification(`QR Code 已產生，${validMinutes} 分鐘內有效`, 'success');
+        }
 
     } catch (err) {
         console.error('generateAdminQRCode 錯誤:', err);
@@ -5303,6 +5589,125 @@ async function generateAdminQRCode() {
         btn.disabled    = false;
         btn.textContent = '產生 QR Code';
     }
+}
+
+/**
+ *  列印張貼用的 QR Code 海報（含員工操作步驟）
+ */
+function printOfficeQRCode() {
+    if (!_currentQRInfo || !_currentQRInfo.url) {
+        showNotification('請先產生 QR Code', 'warning');
+        return;
+    }
+
+    const info = _currentQRInfo;
+
+    // 用隱藏容器重新產生一張較大的 QR 圖，取出 data URL
+    const temp = document.createElement('div');
+    temp.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
+    document.body.appendChild(temp);
+
+    new QRCode(temp, {
+        text: info.url,
+        width: 600,
+        height: 600,
+        colorDark: '#1e1b4b',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.M
+    });
+
+    // qrcode.js 產生的可能是 canvas 或 img，稍等它畫完再取圖
+    setTimeout(() => {
+        let dataUrl = '';
+        const canvas = temp.querySelector('canvas');
+        const img = temp.querySelector('img');
+
+        if (canvas) {
+            dataUrl = canvas.toDataURL('image/png');
+        } else if (img) {
+            dataUrl = img.src;
+        }
+
+        temp.remove();
+
+        if (!dataUrl) {
+            showNotification('產生列印圖片失敗，請改用螢幕截圖', 'error');
+            return;
+        }
+
+        const typeLabel = info.punchType === '自動'
+            ? '上下班打卡皆可使用'
+            : (info.punchType + '打卡專用');
+
+        const validLabel = info.isPermanent
+            ? '本 QR Code 長期有效'
+            : '本 QR Code 有使用期限，過期請洽管理員';
+
+        const title = info.locationName ? (info.locationName + ' 打卡') : '出勤打卡';
+
+        const win = window.open('', '_blank');
+        if (!win) {
+            showNotification('瀏覽器擋住了列印視窗，請允許彈出視窗', 'error');
+            return;
+        }
+
+        win.document.write(`
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>${title} QR Code</title>
+<style>
+  @page { size: A4 portrait; margin: 15mm; }
+  body { font-family: "Microsoft JhengHei", "PingFang TC", sans-serif; text-align: center;
+         color: #111; margin: 0; padding: 20px; }
+  h1 { font-size: 34px; margin: 0 0 6px; }
+  .type { display: inline-block; font-size: 20px; font-weight: bold; color: #fff;
+          background: #4f46e5; padding: 8px 24px; border-radius: 999px; margin-bottom: 18px; }
+  .qr { margin: 10px auto 14px; }
+  .qr img { width: 420px; height: 420px; }
+  .steps { text-align: left; max-width: 520px; margin: 0 auto; background: #f8f8ff;
+           border: 2px solid #e0e0f0; border-radius: 12px; padding: 18px 24px; }
+  .steps h2 { font-size: 20px; margin: 0 0 10px; color: #4f46e5; }
+  .steps ol { font-size: 17px; line-height: 1.9; margin: 0; padding-left: 22px; }
+  .note { font-size: 14px; color: #666; margin-top: 14px; line-height: 1.6; }
+  @media print { .no-print { display: none; } }
+</style>
+</head>
+<body>
+  <h1>${title}</h1>
+  <div class="type">${typeLabel}</div>
+  <div class="qr"><img src="${dataUrl}" alt="打卡 QR Code"></div>
+
+  <div class="steps">
+    <h2>打卡步驟</h2>
+    <ol>
+      <li>用手機相機或 LINE 掃描上方 QR Code</li>
+      <li>畫面會自動開啟「出勤管家」</li>
+      <li>若尚未登入，請先用 LINE 帳號登入</li>
+      <li>看到「QR 打卡成功」的綠色訊息就完成了</li>
+    </ol>
+  </div>
+
+  <p class="note">
+    ${validLabel}<br>
+    掃描後請務必確認螢幕出現「打卡成功」再離開。<br>
+    同一天同一種類型只能打一次，重複掃描不會重複記錄。
+  </p>
+
+  <p class="no-print" style="margin-top:24px;">
+    <button onclick="window.print()"
+            style="padding:12px 28px;font-size:16px;font-weight:bold;background:#4f46e5;
+                   color:#fff;border:none;border-radius:8px;cursor:pointer;">
+      列印這張海報
+    </button>
+  </p>
+</body>
+</html>
+        `);
+        win.document.close();
+
+    }, 300);
 }
 
 /**

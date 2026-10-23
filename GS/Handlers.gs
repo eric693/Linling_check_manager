@@ -192,8 +192,22 @@ function handleExchangeToken(otoken) {
 // ==================== 打卡功能相關 ====================
 
 function handlePunch(params) {
-  const { token, type, lat, lng, note } = params;
-  return punch(token, type, parseFloat(lat), parseFloat(lng), note);
+  const { token, type, lat, lng, note, remark } = params;
+  return punch(token, type, parseFloat(lat), parseFloat(lng), note, remark);
+}
+
+/**
+ *  取得待審核的打卡備註（管理員）
+ */
+function handleGetPendingPunchRemarks(params) {
+  return getPendingPunchRemarks(params.token);
+}
+
+/**
+ *  審核打卡備註（管理員）
+ */
+function handleReviewPunchRemark(params) {
+  return reviewPunchRemark(params.token, params.rowNumber, params.reviewAction, params.comment || '');
 }
 
 // function handleAdjustPunch(params) {
@@ -216,22 +230,50 @@ function handleLinePunchWithToken(params) {
 
     const props = PropertiesService.getScriptProperties();
     const key = 'LPT_' + token;
-    const dataStr = props.getProperty(key);
+    
+    //  同一個連結同時被點兩次時，只讓一個請求進行
+    const lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(10000);
+    } catch (lockErr) {
+      return { ok: false, code: 'ERR_BUSY', msg: '系統忙碌中，請稍後再試一次' };
+    }
+    
+    try {
+      const dataStr = props.getProperty(key);
 
-    if (!dataStr) {
-      return { ok: false, code: 'ERR_LPT_INVALID', msg: '打卡連結無效或已使用，請重新在 LINE 輸入打卡指令' };
+      if (!dataStr) {
+        return { ok: false, code: 'ERR_LPT_INVALID', msg: '此連結已完成打卡或已失效，請在 LINE 重新輸入打卡指令' };
+      }
+
+      const data = JSON.parse(dataStr);
+
+      if (new Date().getTime() > data.expiry) {
+        props.deleteProperty(key);
+        return { ok: false, code: 'ERR_LPT_EXPIRED', msg: '打卡連結已過期，請在 LINE 重新輸入打卡指令' };
+      }
+
+      //  不在這裡刪除 token
+      //  原本一取得 token 就立即刪除，只要之後任何一步失敗
+      //  （不在範圍內、網路中斷…），使用者再點同一個連結就會變成
+      //  「連結無效或已使用」。改為「打卡成功後才刪除」。
+      return doLinePunch_(props, key, data, lat, lng);
+      
+    } finally {
+      lock.releaseLock();
     }
 
-    const data = JSON.parse(dataStr);
+  } catch (err) {
+    Logger.log('handleLinePunchWithToken 錯誤: ' + err.message);
+    return { ok: false, code: 'ERR_INTERNAL', msg: '系統錯誤，請稍後再試' };
+  }
+}
 
-    if (new Date().getTime() > data.expiry) {
-      props.deleteProperty(key);
-      return { ok: false, code: 'ERR_LPT_EXPIRED', msg: '打卡連結已過期（5 分鐘），請重新在 LINE 輸入打卡指令' };
-    }
-
-    // 單次使用：立即刪除 token
-    props.deleteProperty(key);
-
+/**
+ *  實際執行 LINE 打卡（token 僅在成功後刪除）
+ */
+function doLinePunch_(props, key, data, lat, lng) {
+  try {
     const userId    = data.userId;
     const punchType = data.punchType;
     const latF      = parseFloat(lat);
@@ -256,6 +298,9 @@ function handleLinePunchWithToken(params) {
     if (!result.success) {
       return { ok: false, code: 'ERR_PUNCH_FAILED', msg: result.message };
     }
+
+    //  打卡成功，此時才讓連結失效
+    props.deleteProperty(key);
 
     // 推播 LINE 成功通知給本人
     try {
@@ -289,7 +334,7 @@ function handleLinePunchWithToken(params) {
     };
 
   } catch (err) {
-    Logger.log('handleLinePunchWithToken 錯誤: ' + err.message);
+    Logger.log('doLinePunch_ 錯誤: ' + err.message);
     return { ok: false, code: 'ERR_INTERNAL', msg: '系統錯誤，請稍後再試' };
   }
 }
@@ -451,7 +496,7 @@ function handleGetAbnormalRecords(params) {
   const { month, userId } = params;
   if (!month) return { ok: false, code: "ERR_MISSING_MONTH" };
   const records = getAttendanceRecords(month, userId);
-  const abnormalResults = checkAttendanceAbnormal(records);
+  const abnormalResults = checkAttendanceAbnormal(records, userId, month);
   return { ok: true, records: abnormalResults };
 }
 
@@ -663,31 +708,8 @@ function handleRejectReview(params) {
 
 // ==================== 加班功能相關 ====================
 
-function handleGetEmployeeOvertime(params) {
-  Logger.log(`查詢員工加班記錄`);
-  return getEmployeeOvertimeRequests(params.token);
-}
 
-function handleGetPendingOvertime(params) {
-  Logger.log(`查詢待審核加班申請`);
-  return getPendingOvertimeRequests(params.token);
-}
 
-function handleReviewOvertime(params) {
-  const { token, rowNumber, reviewAction, comment } = params;
-  
-  Logger.log(`handleReviewOvertime 收到參數:`);
-  Logger.log(`   - rowNumber: ${rowNumber}`);
-  Logger.log(`   - reviewAction: "${reviewAction}"`);
-  Logger.log(`   - comment: "${comment}"`);
-  
-  return reviewOvertimeRequest(
-    token, 
-    parseInt(rowNumber), 
-    reviewAction,
-    comment || ""
-  );
-}
 
 // ==================== 請假功能相關 ====================
 
@@ -1426,104 +1448,7 @@ function testDiagnoseSalaryParams() {
   Logger.log('═══════════════════════════════════════');
 }
 
-/**
- *  檢查 salaryData 物件是否正確組裝
- */
-function testCheckSalaryDataObject() {
-  Logger.log('═══════════════════════════════════════');
-  Logger.log(' 檢查 salaryData 物件組裝');
-  Logger.log('═══════════════════════════════════════');
-  Logger.log('');
-  
-  const params = {
-    employeeId: 'TEST123',
-    employeeName: '測試員工',
-    baseSalary: '60000',
-    positionAllowance: '10',
-    mealAllowance: '10',
-    otherAllowances: '47',
-    dormitoryFee: '67',
-    otherDeductions: '90'
-  };
-  
-  const safeString = (value) => {
-    if (value === null || value === undefined) return '';
-    return String(value).trim();
-  };
-  
-  const safeNumber = (value) => {
-    if (value === null || value === undefined) return 0;
-    const num = parseFloat(value);
-    return isNaN(num) ? 0 : num;
-  };
-  
-  const salaryData = {
-    employeeId: safeString(params.employeeId),
-    employeeName: safeString(params.employeeName),
-    baseSalary: safeNumber(params.baseSalary),
-    positionAllowance: safeNumber(params.positionAllowance),
-    mealAllowance: safeNumber(params.mealAllowance),
-    otherAllowances: safeNumber(params.otherAllowances),
-    dormitoryFee: safeNumber(params.dormitoryFee),
-    otherDeductions: safeNumber(params.otherDeductions)
-  };
-  
-  Logger.log(' salaryData 物件內容:');
-  Logger.log('   employeeId: ' + salaryData.employeeId);
-  Logger.log('   employeeName: ' + salaryData.employeeName);
-  Logger.log('   baseSalary: ' + salaryData.baseSalary + ' (型別: ' + typeof salaryData.baseSalary + ')');
-  Logger.log('   positionAllowance: ' + salaryData.positionAllowance + ' ⭐ (型別: ' + typeof salaryData.positionAllowance + ')');
-  Logger.log('   mealAllowance: ' + salaryData.mealAllowance + ' ⭐ (型別: ' + typeof salaryData.mealAllowance + ')');
-  Logger.log('   otherAllowances: ' + salaryData.otherAllowances + ' ⭐ (型別: ' + typeof salaryData.otherAllowances + ')');
-  Logger.log('   dormitoryFee: ' + salaryData.dormitoryFee + ' ⭐ (型別: ' + typeof salaryData.dormitoryFee + ')');
-  Logger.log('   otherDeductions: ' + salaryData.otherDeductions + ' ⭐ (型別: ' + typeof salaryData.otherDeductions + ')');
-  Logger.log('');
-  
-  if (salaryData.positionAllowance === 10 && 
-      salaryData.mealAllowance === 10 && 
-      salaryData.otherAllowances === 47) {
-    Logger.log(' salaryData 物件組裝正確！');
-  } else {
-    Logger.log(' salaryData 物件組裝有問題');
-  }
-  
-  Logger.log('═══════════════════════════════════════');
-}
 
-/**
- *  檢查 Sheet 欄位結構
- */
-function testCheckSheetStructure() {
-  Logger.log('═══════════════════════════════════════');
-  Logger.log(' 檢查 Sheet 欄位結構');
-  Logger.log('═══════════════════════════════════════');
-  Logger.log('');
-  
-  const sheet = getEmployeeSalarySheet();
-  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  
-  Logger.log(' Sheet 欄位總數: ' + headers.length);
-  Logger.log('');
-  Logger.log(' 完整欄位列表:');
-  
-  headers.forEach((header, index) => {
-    const column = String.fromCharCode(65 + index);
-    Logger.log(`   ${column} (${index + 1}): ${header}`);
-  });
-  
-  Logger.log('');
-  Logger.log(' 關鍵欄位檢查:');
-  Logger.log('   G 欄 (7):  ' + headers[6] + (headers[6] === '職務加給' ? ' ' : ' '));
-  Logger.log('   H 欄 (8):  ' + headers[7] + (headers[7] === '伙食費' ? ' ' : ' '));
-  Logger.log('   I 欄 (9):  ' + headers[8] + (headers[8] === '交通補助' ? ' ' : ' '));
-  Logger.log('   L 欄 (12): ' + headers[11] + (headers[11] === '其他津貼' ? ' ' : ' '));
-  Logger.log('   M 欄 (13): ' + headers[12] + (headers[12] === '銀行代碼' ? ' ' : ' '));
-  Logger.log('   N 欄 (14): ' + headers[13] + (headers[13] === '銀行帳號' ? ' ' : ' '));
-  Logger.log('   X 欄 (24): ' + headers[23] + (headers[23] === '宿舍費用' ? ' ' : ' '));
-  Logger.log('   Z 欄 (26): ' + headers[25] + (headers[25] === '其他扣款' ? ' ' : ' '));
-  
-  Logger.log('═══════════════════════════════════════');
-}
 /**
  *  檢查 Sheet 欄位結構
  */
@@ -2147,75 +2072,7 @@ function handleCalculateDailySalary(params) {
   }
 }
 
-/**
- *  處理設定日薪員工（保持不變）
- */
-function handleSetDailyEmployee(params) {
-  try {
-    if (!params.token || !validateSession(params.token)) {
-      return { ok: false, msg: "未授權或 session 已過期" };
-    }
-    
-    const employeeData = {
-      employeeId: params.employeeId,
-      employeeName: params.employeeName,
-      bloodType: params.bloodType,
-      phone: params.phone,
-      birthDate: params.birthDate,
-      emergencyContact: params.emergencyContact,
-      emergencyPhone: params.emergencyPhone,
-      address: params.address,
-      dailySalary: parseFloat(params.dailySalary) || 0,
-      overtimeHourlyRate: parseFloat(params.overtimeHourlyRate) || 0,
-      mealAllowancePerDay: parseFloat(params.mealAllowancePerDay) || 0,
-      drivingAllowance: parseFloat(params.drivingAllowance) || 0,
-      positionAllowance: parseFloat(params.positionAllowance) || 0,
-      housingAllowance: parseFloat(params.housingAllowance) || 0,
-      laborFee: parseFloat(params.laborFee) || 0,
-      healthFee: parseFloat(params.healthFee) || 0,
-      dependentHealthFee: parseFloat(params.dependentHealthFee) || 0,
-      bankCode: params.bankCode,
-      bankAccount: params.bankAccount,
-      note: params.note
-    };
-    
-    if (!employeeData.employeeId || !employeeData.employeeName) {
-      return { ok: false, msg: "必填欄位不完整" };
-    }
-    
-    const result = setDailyEmployee(employeeData);
-    return { 
-      ok: result.success, 
-      msg: result.message,
-      data: result 
-    };
-    
-  } catch (error) {
-    Logger.log(' handleSetDailyEmployee 錯誤: ' + error);
-    return { ok: false, msg: error.message };
-  }
-}
 
-/**
- *  處理取得日薪員工資料（保持不變）
- */
-function handleGetDailyEmployee(params) {
-  try {
-    if (!params.token || !validateSession(params.token)) {
-      return { ok: false, msg: "未授權" };
-    }
-    
-    if (!params.employeeId) {
-      return { ok: false, msg: "缺少員工ID" };
-    }
-    
-    const result = getDailyEmployee(params.employeeId);
-    return { ok: result.success, data: result.data, msg: result.message };
-    
-  } catch (error) {
-    return { ok: false, msg: error.message };
-  }
-}
 
 /**
  *  處理儲存日薪記錄（保持不變）
@@ -2312,7 +2169,7 @@ function handleInitApp(params) {
     const userId = session.user.userId;
     
     const records = getAttendanceRecords(month, userId);
-    const abnormalResults = checkAttendanceAbnormal(records);
+    const abnormalResults = checkAttendanceAbnormal(records, userId, month);
     
     //  3. 取得加班記錄（新增）
     const overtimeRecords = getApprovedOvertimeRecords(userId, month);

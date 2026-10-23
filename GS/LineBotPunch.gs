@@ -15,7 +15,7 @@ function handleLineMessage(event) {
     const employee = findEmployeeByLineUserId_(userId);
     
     if (!employee.ok) {
-      replyMessage(replyToken, ' 您尚未註冊為系統員工\n\n請先到網頁版登入以完成註冊\n https://eric693.github.io/Linling_check_manager/');
+      replyMessage(replyToken, ' 您尚未註冊為系統員工\n\n請先到網頁版登入以完成註冊\n https://eric693.github.io/yi-chun_check_manager/');
       return;
     }
     
@@ -220,57 +220,6 @@ function generateRecentMonths(count) {
   return months;
 }
 
-/**
- *  發送指定月份的打卡記錄
- * 
- * 功能:
- * - 顯示該月份所有的上下班打卡記錄
- * - 按日期分組顯示
- * - 包含統計資訊（總天數、總工時）
- * - 使用 Flex Message Carousel 分頁顯示（如果記錄太多）
- */
-function sendMonthlyRecords(replyToken, userId, employeeName, yearMonth) {
-  try {
-    Logger.log(' 發送月份打卡記錄');
-    Logger.log('   userId: ' + userId);
-    Logger.log('   yearMonth: ' + yearMonth);
-    
-    // 驗證月份格式
-    if (!yearMonth.match(/^\d{4}-\d{2}$/)) {
-      replyMessage(replyToken, ' 月份格式錯誤\n\n請重新選擇月份');
-      return;
-    }
-    
-    // 從資料庫取得該月份的打卡記錄
-    const records = getMonthlyPunchRecords(userId, yearMonth);
-    
-    if (records.length === 0) {
-      const monthLabel = yearMonth.replace('-', '年') + '月';
-      replyMessage(replyToken, ` ${monthLabel}\n\n${employeeName}，您這個月還沒有打卡記錄`);
-      return;
-    }
-    
-    // 按日期分組
-    const groupedRecords = groupRecordsByDate(records);
-    
-    // 計算統計資訊
-    const stats = calculateMonthlyStats(groupedRecords);
-    
-    // 建立 Flex Message
-    // 如果記錄太多（超過 10 天），使用 Carousel 分頁顯示
-    if (Object.keys(groupedRecords).length > 10) {
-      sendMonthlyRecordsCarousel(replyToken, employeeName, yearMonth, groupedRecords, stats);
-    } else {
-      sendMonthlyRecordsSingle(replyToken, employeeName, yearMonth, groupedRecords, stats);
-    }
-    
-    Logger.log(' 月份打卡記錄已發送');
-    
-  } catch (error) {
-    Logger.log(' sendMonthlyRecords 錯誤: ' + error);
-    replyMessage(replyToken, ' 查詢失敗，請稍後再試');
-  }
-}
 
 function getMonthlyPunchRecords(userId, yearMonth) {
   try {
@@ -819,18 +768,52 @@ function formatDateLabel(dateStr) {
   return `${month}/${day} (${weekday})`;
 }
 /**
- * 產生一次性 LINE 打卡 Token（5 分鐘有效）
+ * 產生一次性 LINE 打卡 Token（15 分鐘有效）
  */
+//  LINE 打卡連結有效期（毫秒）
+const LINE_PUNCH_TOKEN_TTL_MS = 15 * 60 * 1000;
+
 function generateLinePunchToken_(userId, punchType) {
+  const props = PropertiesService.getScriptProperties();
+  
+  //  順手清掉過期的舊 token，避免無限累積
+  cleanupExpiredPunchTokens_(props);
+  
   const token = 'LPT' + Utilities.getUuid().replace(/-/g, '').substring(0, 12).toUpperCase();
   const data = JSON.stringify({
     userId: userId,
     punchType: punchType,
-    expiry: new Date().getTime() + 5 * 60 * 1000
+    //  有效期 5 分鐘太短（收訊差、等定位就用掉了），延長為 15 分鐘
+    expiry: new Date().getTime() + LINE_PUNCH_TOKEN_TTL_MS
   });
-  PropertiesService.getScriptProperties().setProperty('LPT_' + token, data);
+  props.setProperty('LPT_' + token, data);
   Logger.log('LINE 打卡 Token 已生成: ' + token + ' (' + punchType + ')');
   return token;
+}
+
+
+/**
+ *  清除已過期的 LINE 打卡 Token
+ */
+function cleanupExpiredPunchTokens_(props) {
+  try {
+    const all = props.getProperties();
+    const now = new Date().getTime();
+    
+    Object.keys(all).forEach(function (key) {
+      if (key.indexOf('LPT_') !== 0) return;
+      try {
+        const data = JSON.parse(all[key]);
+        if (data.expiry && now > data.expiry) {
+          props.deleteProperty(key);
+        }
+      } catch (parseErr) {
+        props.deleteProperty(key); // 格式壞掉的也一併清除
+      }
+    });
+  } catch (err) {
+    Logger.log('清除過期打卡 Token 失敗（不影響打卡）: ' + err.message);
+  }
 }
 
 /**
@@ -838,7 +821,7 @@ function generateLinePunchToken_(userId, punchType) {
  */
 function sendLinePunchLink(replyToken, userId, employeeName, punchType) {
   const token = generateLinePunchToken_(userId, punchType);
-  const url = 'https://eric693.github.io/Linling_check_manager/?linePunchToken=' + token;
+  const url = 'https://eric693.github.io/yi-chun_check_manager/?linePunchToken=' + token;
   const color = punchType === '上班' ? '#4CAF50' : '#FF9800';
   const emoji = punchType === '上班' ? '🟢' : '🟠';
 
@@ -885,7 +868,7 @@ function sendLinePunchLink(replyToken, userId, employeeName, punchType) {
           },
           {
             type: 'text',
-            text: '⏳ 連結 5 分鐘內有效',
+            text: '⏳ 連結 15 分鐘內有效',
             size: 'sm',
             color: '#FF5722',
             align: 'center',
@@ -1927,7 +1910,7 @@ function sendAdjustPunchGuide(replyToken) {
             action: {
               type: 'uri',
               label: '開啟網頁版',
-              uri: 'https://eric693.github.io/Linling_check_manager/'
+              uri: 'https://eric693.github.io/yi-chun_check_manager/'
             },
             color: '#FF9800'
           }
@@ -2356,7 +2339,7 @@ function sendHelpMessage(replyToken) {
             action: {
               type: 'uri',
               label: '開啟網頁版',
-              uri: 'https://eric693.github.io/Linling_check_manager/'
+              uri: 'https://eric693.github.io/yi-chun_check_manager/'
             }
           }
         ],
@@ -3966,7 +3949,7 @@ function sendOvertimeApplicationGuide(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: ' 開啟網頁版',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               },
               color: '#FF9800'
             },
@@ -4294,7 +4277,7 @@ function sendMyOvertimeRecords(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: ' 查看完整記錄',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               }
             }
           ]
@@ -5005,7 +4988,7 @@ function sendMonthlyShifts(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: ' 查看完整排班',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               }
             }
           ]
@@ -5741,7 +5724,7 @@ function sendLeaveApplicationMenu(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: ' 開啟網頁版申請',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               },
               color: '#FF9800'
             },
@@ -6081,7 +6064,7 @@ function sendMyLeaveRecords(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: '查看完整記錄',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               }
             },
             {
@@ -6134,21 +6117,26 @@ function sendLeaveBalance(replyToken, userId, employeeName) {
     
     for (let i = 1; i < values.length; i++) {
       if (values[i][0] === userId) {
+        //  欄位對照（假期餘額表共 19 欄）
+        //  A員工ID B姓名 C到職日 D特休 E未住院病假 F事假 G喪假 H婚假 I產假
+        //  J陪產 K住院病假 L生理假 M家庭照顧 N公假 O公傷 P天災 Q補休 R曠工 S更新時間
+        //  原本從 index 2 起算，漏掉了 C 欄（到職日），導致每個假別都往前位移一格
+        //  （LINE 顯示的「事假」其實是未住院病假的時數）
         balance = {
-          annual: values[i][2] || 0,
-          sick: values[i][3] || 0,
-          personal: values[i][4] || 0,
-          bereavement: values[i][5] || 0,
-          marriage: values[i][6] || 0,
-          maternity: values[i][7] || 0,
-          paternity: values[i][8] || 0,
-          hospitalization: values[i][9] || 0,
-          menstrual: values[i][10] || 0,
-          familyCare: values[i][11] || 0,
-          official: values[i][12] || 0,
-          workInjury: values[i][13] || 0,
-          disaster: values[i][14] || 0,
-          compTimeOff: values[i][15] || 0
+          annual: values[i][3] || 0,           // D: 特休假
+          sick: values[i][4] || 0,             // E: 未住院病假
+          personal: values[i][5] || 0,         // F: 事假
+          bereavement: values[i][6] || 0,      // G: 喪假
+          marriage: values[i][7] || 0,         // H: 婚假
+          maternity: values[i][8] || 0,        // I: 產假
+          paternity: values[i][9] || 0,        // J: 陪產檢及陪產假
+          hospitalization: values[i][10] || 0, // K: 住院病假
+          menstrual: values[i][11] || 0,       // L: 生理假
+          familyCare: values[i][12] || 0,      // M: 家庭照顧假
+          official: values[i][13] || 0,        // N: 公假
+          workInjury: values[i][14] || 0,      // O: 公傷假
+          disaster: values[i][15] || 0,        // P: 天然災害停班
+          compTimeOff: values[i][16] || 0      // Q: 加班補休假
         };
         break;
       }
@@ -6394,7 +6382,7 @@ function sendLeaveBalance(replyToken, userId, employeeName) {
               action: {
                 type: 'uri',
                 label: ' 查看完整假期資訊',
-                uri: 'https://eric693.github.io/Linling_check_manager/'
+                uri: 'https://eric693.github.io/yi-chun_check_manager/'
               }
             },
             {
@@ -6777,22 +6765,40 @@ function deductLeaveBalanceByUserId(userId, leaveType, hours) {
     
     const values = sheet.getDataRange().getValues();
     
+    //  欄位對照必須與 LeaveManagement.gs 的 deductLeaveBalance 一致
+    //  原本少算了 C 欄（到職日），核准事假會扣到「未住院病假」欄位
     const leaveTypeColumnMap = {
-      'ANNUAL_LEAVE': 3,
-      'SICK_LEAVE': 4,
-      'PERSONAL_LEAVE': 5,
-      'BEREAVEMENT_LEAVE': 6,
-      'MARRIAGE_LEAVE': 7,
-      'MATERNITY_LEAVE': 8,
-      'PATERNITY_LEAVE': 9,
-      'HOSPITALIZATION_LEAVE': 10,
-      'MENSTRUAL_LEAVE': 11,
-      'FAMILY_CARE_LEAVE': 12,
-      'OFFICIAL_LEAVE': 13,
-      'WORK_INJURY_LEAVE': 14,
-      'NATURAL_DISASTER_LEAVE': 15,
-      'COMP_TIME_OFF': 16
+      'ANNUAL_LEAVE': 4,            // D
+      'SICK_LEAVE': 5,              // E
+      'PERSONAL_LEAVE': 6,          // F
+      'BEREAVEMENT_LEAVE': 7,       // G
+      'MARRIAGE_LEAVE': 8,          // H
+      'MATERNITY_LEAVE': 9,         // I
+      'PATERNITY_LEAVE': 10,        // J
+      'HOSPITALIZATION_LEAVE': 11,  // K
+      'MENSTRUAL_LEAVE': 12,        // L
+      'FAMILY_CARE_LEAVE': 13,      // M
+      'OFFICIAL_LEAVE': 14,         // N
+      'WORK_INJURY_LEAVE': 15,      // O
+      'NATURAL_DISASTER_LEAVE': 16, // P
+      'COMP_TIME_OFF': 17           // Q
     };
+    
+    //  不受額度限制的假別（法定應給，餘額欄位預設 0 會導致永遠無法核准）
+    const NO_QUOTA_LEAVE_TYPES = [
+      'OFFICIAL_LEAVE',           // 公假（含兵役假）
+      'WORK_INJURY_LEAVE',        // 公傷假
+      'NATURAL_DISASTER_LEAVE'    // 天然災害停班
+    ];
+    
+    if (NO_QUOTA_LEAVE_TYPES.indexOf(leaveType) !== -1) {
+      Logger.log(` ${leaveType} 不受額度限制，不扣除餘額`);
+      return {
+        ok: true,
+        remaining: '不限',
+        unlimited: true
+      };
+    }
     
     const columnIndex = leaveTypeColumnMap[leaveType];
     
@@ -6814,7 +6820,7 @@ function deductLeaveBalanceByUserId(userId, leaveType, hours) {
         const newBalance = currentBalance - hours;
         
         sheet.getRange(i + 1, columnIndex).setValue(newBalance);
-        sheet.getRange(i + 1, 18).setValue(new Date());
+        sheet.getRange(i + 1, 19).setValue(new Date()); //  S 欄（原本寫到 R 欄「曠工」）
         
         Logger.log(' 餘額已更新');
         

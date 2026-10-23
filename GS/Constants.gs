@@ -3,7 +3,7 @@
 // ==================== LINE 登入設定 ====================
 const LINE_CHANNEL_ID     = PropertiesService.getScriptProperties().getProperty("LINE_CHANNEL_ID");
 const LINE_CHANNEL_SECRET = PropertiesService.getScriptProperties().getProperty("LINE_CHANNEL_SECRET");
-const LINE_REDIRECT_URL   = "https://eric693.github.io/Linling_check_manager/";
+const LINE_REDIRECT_URL   = "https://eric693.github.io/yi-chun_check_manager/";
 
 // ==================== Session 設定 ====================
 const SESSION_TTL_MS = 7000 * 60 * 60 * 24; // 1 天
@@ -305,16 +305,6 @@ function isAdmin(user) {
   return user && user.dept === '管理員';
 }
 
-/**
- * 格式化日期
- */
-function formatDate(date) {
-  const d = new Date(date);
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
 
 // ==================== 系統版本資訊 ====================
 const SYSTEM_VERSION = {
